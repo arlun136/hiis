@@ -122,7 +122,7 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return uint64(block.timestamp);
   }
 
-  function _calculateClaim(uint64 grantId, uint256 requestAmount) internal view 
+  function _calculateClaim(uint64 grantId, uint256 requestAmount) public view 
     returns (uint64 newClaimTime, uint64 usedTime, uint256 claimAmount) {
     Grant memory grant = _grants[grantId];
     
@@ -237,15 +237,13 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   //## Grant managemnet functions (Plege Manager)
 
   function createGrant(address addr, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
-    require(_vaultTokenAddr != address(0), "not initialized");
     uint64 grantId = _grantIdCounter++;
-    IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
-
     _grants[grantId] = Grant({
       claimTime: _getTime() - interval,
       claimInterval: interval,
       claimLimit: amount
     });
+    IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
 
     emit GrantUpdate(grantId, amount, interval);
   }
@@ -274,7 +272,6 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   function lockGrant(uint64 grantId, uint64 lockTime) public {
     require(_grants[grantId].claimTime > 0, "grant not found");
     require(
-      _msgSender() == _vaultTokenAddr || 
       _msgSender() == _ownerOf(grantId) || 
       hasRole(PLEDGE_MANAGER_ROLE, _msgSender())
     , "not grant owner or manager");
@@ -283,9 +280,7 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   }
 
   function notifyGrantTransfer(uint64 grantId) public {
-    require(_grants[grantId].claimTime > 0, "grant not found");
-    require(_msgSender() == _vaultTokenAddr, "not grant token contract");
-
+    require(_msgSender() == _vaultTokenAddr, "not token contract");
     _lockGrant(grantId, _claimTransferLockTime);
   }
 
