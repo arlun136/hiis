@@ -122,7 +122,8 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return uint64(block.timestamp);
   }
 
-  function _calculateClaim(uint64 grantId, uint256 requestAmount) internal view returns (uint64, uint64, uint256) {
+  function _calculateClaim(uint64 grantId, uint256 requestAmount) internal view 
+    returns (uint64 newClaimTime, uint64 usedTime, uint256 claimAmount) {
     Grant memory grant = _grants[grantId];
     
     uint256 claimLimit = grant.claimLimit * 1 ether;
@@ -135,18 +136,15 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     }
 
     uint64 time = _getTime();
-    uint64 claimTime;
-    uint64 usedTime;
-    uint256 claimAmount;
     if(_grantClaimLock[grantId] > time) {
       // grant locked
-      claimTime = grant.claimTime;
+      newClaimTime = grant.claimTime;
       usedTime = 0;
       claimAmount = 0;
     }
     else if(grant.claimInterval == 0) {
       // no time restriction
-      claimTime = time;
+      newClaimTime = time;
       usedTime = 0;
       claimAmount = requestAmount;
     }
@@ -170,16 +168,14 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
           usedTime = availableTime;
         }
 
-        claimTime = baseClaimTime + usedTime;
+        newClaimTime = baseClaimTime + usedTime;
         claimAmount = requestAmount;
       }
       else {
         usedTime = availableTime;
-        claimTime = time;
+        newClaimTime = time;
       }
     }
-
-    return (claimTime, usedTime, claimAmount);
   }
 
 
