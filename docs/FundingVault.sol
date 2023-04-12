@@ -4,18 +4,17 @@ pragma solidity ^0.8.17;
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 
 interface IFundingVault {
-  function notifyPledgeTransfer(uint64 pledgeId) external;
+  function notifyGrantTransfer(uint64 grantId) external;
 }
 
 interface IFundingVaultToken is IERC721Enumerable {
-  function pledgeOwner(uint64 tokenId) external view returns (address);
-  function pledgeUpdate(uint64 tokenId, address targetAddr) external;
+  function tokenUpdate(uint64 tokenId, address targetAddr) external;
 }
 
 contract FundingVaultToken is ERC721Enumerable, IFundingVaultToken {
   address private _fundingVault;
 
-  constructor(address fundingVault) ERC721("Funding Pledge", "FundPlg") {
+  constructor(address fundingVault) ERC721("FundingVault Grant", "FVGrant") {
     _fundingVault = fundingVault;
   }
 
@@ -37,14 +36,10 @@ contract FundingVaultToken is ERC721Enumerable, IFundingVaultToken {
   function _beforeTokenTransfer(address from, address to, uint256 tokenId, uint256 batchSize) internal virtual override {
     super._beforeTokenTransfer(from, to, tokenId, batchSize);
 
-    IFundingVault(_fundingVault).notifyPledgeTransfer(uint64(tokenId));
+    IFundingVault(_fundingVault).notifyGrantTransfer(uint64(tokenId));
   }
 
-  function pledgeOwner(uint64 tokenId) public view returns (address) {
-    return _ownerOf(tokenId);
-  }
-
-  function pledgeUpdate(uint64 tokenId, address targetAddr) public {
+  function tokenUpdate(uint64 tokenId, address targetAddr) public {
     require(_msgSender() == _fundingVault, "not vault contract");
 
     if(targetAddr != address(0)) {
@@ -65,7 +60,7 @@ contract FundingVaultToken is ERC721Enumerable, IFundingVaultToken {
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
 
-struct Pledge {
+struct Grant {
   uint64 claimTime;
   uint64 claimInterval;
   uint128 claimLimit;
@@ -76,29 +71,26 @@ contract FundingVaultStorage {
   address internal _vaultTokenAddr;
 
   // slot 0x02
-  uint64 internal _pledgeIdCounter;
-  uint64 internal _claimTransferLockTime;
+  uint64 internal _grantIdCounter = 1;
+  uint64 internal _claimTransferLockTime = 86400 * 2; // 2 days
 
   // mappings
-  mapping(uint64 => Pledge) internal _pledges;
-  mapping(uint64 => uint64) internal _pledgeClaimLock;
+  mapping(uint64 => Grant) internal _grants;
+  mapping(uint64 => uint64) internal _grantClaimLock;
 }
 
 contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   bytes32 public constant PLEDGE_MANAGER_ROLE = keccak256("PLEDGE_MANAGER_ROLE");
 
-  event PledgeLocked(uint64 indexed pledgeId, uint64 lockTime, uint64 lockTimeout);
-  event PledgeUpdate(uint64 indexed pledgeId, uint128 amount, uint64 interval);
-  event FundClaim(uint64 indexed pledgeId, address indexed to, uint256 amount, uint64 pledgeTimeUsed);
+  event GrantLock(uint64 indexed grantId, uint64 lockTime, uint64 lockTimeout);
+  event GrantUpdate(uint64 indexed grantId, uint128 amount, uint64 interval);
+  event GrantClaim(uint64 indexed grantId, address indexed to, uint256 amount, uint64 grantTimeUsed);
   
   constructor() {
     _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
     _grantRole(PLEDGE_MANAGER_ROLE, _msgSender());
 
     _vaultTokenAddr = address(new FundingVaultToken(address(this)));
-
-    _pledgeIdCounter = 1;
-    _claimTransferLockTime = 86400 * 2; // 2 days
   }
 
   receive() external payable {
@@ -123,17 +115,17 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   //## Internal helper functions
 
   function _ownerOf(uint64 tokenId) internal view returns (address) {
-    return IFundingVaultToken(_vaultTokenAddr).pledgeOwner(tokenId);
+    return IFundingVaultToken(_vaultTokenAddr).ownerOf(tokenId);
   }
 
   function _getTime() internal view returns (uint64) {
     return uint64(block.timestamp);
   }
 
-  function _calculateClaim(uint64 pledgeId, uint256 requestAmount) internal view returns (uint64, uint64, uint256) {
-    Pledge memory pledge = _pledges[pledgeId];
+  function _calculateClaim(uint64 grantId, uint256 requestAmount) internal view returns (uint64, uint64, uint256) {
+    Grant memory grant = _grants[grantId];
     
-    uint256 claimLimit = pledge.claimLimit * 1 ether;
+    uint256 claimLimit = grant.claimLimit * 1 ether;
     if(requestAmount > claimLimit) {
       requestAmount = claimLimit;
     }
@@ -146,30 +138,34 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     uint64 claimTime;
     uint64 usedTime;
     uint256 claimAmount;
-    if(_pledgeClaimLock[pledgeId] > time) {
-      // pledge locked
-      claimTime = pledge.claimTime;
+    if(_grantClaimLock[grantId] > time) {
+      // grant locked
+      claimTime = grant.claimTime;
       usedTime = 0;
       claimAmount = 0;
     }
-    else if(pledge.claimInterval == 0) {
+    else if(grant.claimInterval == 0) {
       // no time restriction
       claimTime = time;
       usedTime = 0;
       claimAmount = requestAmount;
     }
     else {
-      uint64 baseClaimTime = pledge.claimTime;
+      uint64 baseClaimTime = grant.claimTime;
       uint64 availableTime = time - baseClaimTime;
-      if(availableTime > pledge.claimInterval) {
-        availableTime = pledge.claimInterval;
-        baseClaimTime = time - pledge.claimInterval;
+      if(availableTime > grant.claimInterval) {
+        availableTime = grant.claimInterval;
+        baseClaimTime = time - grant.claimInterval;
       }
 
-      claimAmount = claimLimit * availableTime / pledge.claimInterval;
+      claimAmount = claimLimit * availableTime / grant.claimInterval;
       if(requestAmount != 0 && requestAmount < claimAmount) {
         // partial claim
-        usedTime = uint64(requestAmount * pledge.claimInterval / claimLimit) + 1;
+        usedTime = uint64(requestAmount * grant.claimInterval / claimLimit);
+        if(usedTime * claimLimit / grant.claimInterval < requestAmount) {
+          usedTime++; // round up if there is a rounding gap in ETH amount
+        }
+
         if(usedTime > availableTime) {
           usedTime = availableTime;
         }
@@ -193,26 +189,26 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return _vaultTokenAddr;
   }
 
-  function getPledges() public view returns (Pledge[] memory) {
+  function getGrants() public view returns (Grant[] memory) {
     IFundingVaultToken vaultToken = IFundingVaultToken(_vaultTokenAddr);
-    uint64 pledgeCount = uint64(vaultToken.totalSupply());
-    Pledge[] memory pledges = new Pledge[](pledgeCount);
-    for(uint64 pledgeIdx = 0; pledgeIdx < pledgeCount; pledgeIdx++) {
-      uint64 pledgeId = uint64(vaultToken.tokenByIndex(pledgeIdx));
-      pledges[pledgeIdx] = _pledges[pledgeId];
+    uint64 grantCount = uint64(vaultToken.totalSupply());
+    Grant[] memory grants = new Grant[](grantCount);
+    for(uint64 grantIdx = 0; grantIdx < grantCount; grantIdx++) {
+      uint64 grantId = uint64(vaultToken.tokenByIndex(grantIdx));
+      grants[grantIdx] = _grants[grantId];
     }
-    return pledges;
+    return grants;
   }
 
-  function getPledge(uint64 pledgeId) public view returns (Pledge memory) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    return _pledges[pledgeId];
+  function getGrant(uint64 grantId) public view returns (Grant memory) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    return _grants[grantId];
   }
 
-  function getPledgeLockTime(uint32 pledgeId) public view returns (uint64) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    if(_pledgeClaimLock[pledgeId] > uint64(block.timestamp)) {
-      return _pledgeClaimLock[pledgeId] - uint64(block.timestamp);
+  function getGrantLockTime(uint32 grantId) public view returns (uint64) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    if(_grantClaimLock[grantId] > uint64(block.timestamp)) {
+      return _grantClaimLock[grantId] - uint64(block.timestamp);
     }
     else {
       return 0;
@@ -223,91 +219,90 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     uint256 claimableAmount = 0;
     IFundingVaultToken vaultToken = IFundingVaultToken(_vaultTokenAddr);
 
-    uint64 pledgeCount = uint64(vaultToken.balanceOf(_msgSender()));
-    for(uint64 pledgeIdx = 0; pledgeIdx < pledgeCount; pledgeIdx++) {
-      uint64 pledgeId = uint64(vaultToken.tokenOfOwnerByIndex(_msgSender(), pledgeIdx));
-      claimableAmount += _claimableBalance(pledgeId);
+    uint64 grantCount = uint64(vaultToken.balanceOf(_msgSender()));
+    for(uint64 grantIdx = 0; grantIdx < grantCount; grantIdx++) {
+      uint64 grantId = uint64(vaultToken.tokenOfOwnerByIndex(_msgSender(), grantIdx));
+      claimableAmount += _claimableBalance(grantId);
     }
     return claimableAmount;
   }
 
-  function getClaimableBalance(uint64 pledgeId) public view returns (uint256) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    return _claimableBalance(pledgeId);
+  function getClaimableBalance(uint64 grantId) public view returns (uint256) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    return _claimableBalance(grantId);
   }
 
-  function _claimableBalance(uint64 pledgeId) internal view returns (uint256) {
-    (, , uint256 claimAmount) = _calculateClaim(pledgeId, 0);
+  function _claimableBalance(uint64 grantId) internal view returns (uint256) {
+    (, , uint256 claimAmount) = _calculateClaim(grantId, 0);
     return claimAmount;
   }
 
 
-  //## Pledge managemnet functions (Plege Manager)
+  //## Grant managemnet functions (Plege Manager)
 
-  function createPledge(address addr, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
+  function createGrant(address addr, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
     require(_vaultTokenAddr != address(0), "not initialized");
-    uint64 pledgeId = _pledgeIdCounter++;
+    uint64 grantId = _grantIdCounter++;
+    IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
 
-    _pledges[pledgeId] = Pledge({
+    _grants[grantId] = Grant({
       claimTime: _getTime() - interval,
       claimInterval: interval,
       claimLimit: amount
     });
 
-    IFundingVaultToken(_vaultTokenAddr).pledgeUpdate(pledgeId, addr);
-
-    emit PledgeUpdate(pledgeId, amount, interval);
+    emit GrantUpdate(grantId, amount, interval);
   }
 
-  function updatePledge(uint64 pledgeId, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
+  function updateGrant(uint64 grantId, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
 
-    _pledges[pledgeId].claimInterval = interval;
-    _pledges[pledgeId].claimLimit = amount;
+    _grants[grantId].claimInterval = interval;
+    _grants[grantId].claimLimit = amount;
 
-    emit PledgeUpdate(pledgeId, amount, interval);
+    emit GrantUpdate(grantId, amount, interval);
   }
 
-  function transferPledge(uint64 pledgeId, address addr) public onlyRole(PLEDGE_MANAGER_ROLE) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    IFundingVaultToken(_vaultTokenAddr).pledgeUpdate(pledgeId, addr);
+  function transferGrant(uint64 grantId, address addr) public onlyRole(PLEDGE_MANAGER_ROLE) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
   }
 
-  function removePledge(uint64 pledgeId) public onlyRole(PLEDGE_MANAGER_ROLE) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
+  function removeGrant(uint64 grantId) public onlyRole(PLEDGE_MANAGER_ROLE) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
 
-    IFundingVaultToken(_vaultTokenAddr).pledgeUpdate(pledgeId, address(0));
-    delete _pledges[pledgeId];
+    IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, address(0));
+    delete _grants[grantId];
   }
 
-  function lockPledge(uint64 pledgeId, uint64 lockTime) public {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
+  function lockGrant(uint64 grantId, uint64 lockTime) public {
+    require(_grants[grantId].claimTime > 0, "grant not found");
     require(
       _msgSender() == _vaultTokenAddr || 
-      _msgSender() == _ownerOf(pledgeId) || 
+      _msgSender() == _ownerOf(grantId) || 
       hasRole(PLEDGE_MANAGER_ROLE, _msgSender())
-    , "not pledge owner or manager");
+    , "not grant owner or manager");
 
-    _lockPledge(pledgeId, lockTime);
+    _lockGrant(grantId, lockTime);
   }
 
-  function notifyPledgeTransfer(uint64 pledgeId) public {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    require(_msgSender() == _vaultTokenAddr, "not pledge token contract");
+  function notifyGrantTransfer(uint64 grantId) public {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    require(_msgSender() == _vaultTokenAddr, "not grant token contract");
 
-    _lockPledge(pledgeId, _claimTransferLockTime);
+    _lockGrant(grantId, _claimTransferLockTime);
   }
 
-  function _lockPledge(uint64 pledgeId, uint64 lockTime) internal {
+  function _lockGrant(uint64 grantId, uint64 lockTime) internal {
     uint64 lockTimeout = _getTime() + lockTime;
-    if(lockTimeout > _pledgeClaimLock[pledgeId] || hasRole(DEFAULT_ADMIN_ROLE, _msgSender())) {
-      _pledgeClaimLock[pledgeId] = lockTimeout;
+    if(lockTimeout > _grantClaimLock[grantId] || hasRole(DEFAULT_ADMIN_ROLE, _msgSender())) {
+      _grantClaimLock[grantId] = lockTimeout;
     }
     else {
       lockTime = 0;
-      lockTimeout = _pledgeClaimLock[pledgeId];
+      lockTimeout = _grantClaimLock[grantId];
     }
-    emit PledgeLocked(pledgeId, lockTime, lockTimeout);
+    emit GrantLock(grantId, lockTime, lockTimeout);
   }
 
   
@@ -324,11 +319,11 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return claimAmount;
   }
 
-  function claim(uint64 pledgeId, uint256 amount) public returns (uint256) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    require(_ownerOf(pledgeId) == _msgSender(), "not owner of this pledge");
+  function claim(uint64 grantId, uint256 amount) public returns (uint256) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    require(_ownerOf(grantId) == _msgSender(), "not owner of this grant");
 
-    uint256 claimAmount = _claim(pledgeId, amount, _msgSender());
+    uint256 claimAmount = _claim(grantId, amount, _msgSender());
     if(amount > 0) {
       require(claimAmount == amount, "claim failed");
     }
@@ -349,11 +344,11 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return claimAmount;
   }
 
-  function claimTo(uint64 pledgeId, uint256 amount, address target) public returns (uint256) {
-    require(_pledges[pledgeId].claimTime > 0, "pledge not found");
-    require(_ownerOf(pledgeId) == _msgSender(), "not owner of this pledge");
+  function claimTo(uint64 grantId, uint256 amount, address target) public returns (uint256) {
+    require(_grants[grantId].claimTime > 0, "grant not found");
+    require(_ownerOf(grantId) == _msgSender(), "not owner of this grant");
 
-    uint256 claimAmount = _claim(pledgeId, amount, target);
+    uint256 claimAmount = _claim(grantId, amount, target);
     if(amount > 0) {
       require(claimAmount == amount, "claim failed");
     }
@@ -367,10 +362,10 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     uint256 claimAmount = 0;
     IFundingVaultToken vaultToken = IFundingVaultToken(_vaultTokenAddr);
 
-    uint64 pledgeCount = uint64(vaultToken.balanceOf(owner));
-    for(uint64 pledgeIdx = 0; pledgeIdx < pledgeCount; pledgeIdx++) {
-      uint64 pledgeId = uint64(vaultToken.tokenOfOwnerByIndex(owner, pledgeIdx));
-      uint256 claimed = _claim(pledgeId, amount, target);
+    uint64 grantCount = uint64(vaultToken.balanceOf(owner));
+    for(uint64 grantIdx = 0; grantIdx < grantCount; grantIdx++) {
+      uint64 grantId = uint64(vaultToken.tokenOfOwnerByIndex(owner, grantIdx));
+      uint256 claimed = _claim(grantId, amount, target);
       claimAmount += claimed;
       if(amount > 0) {
         if(amount == claimed) {
@@ -384,19 +379,19 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     return claimAmount;
   }
 
-  function _claim(uint64 pledgeId, uint256 amount, address target) internal returns (uint256) {
-    (uint64 newClaimTime, uint64 usedClaimTime, uint256 claimAmount) = _calculateClaim(pledgeId, amount);
+  function _claim(uint64 grantId, uint256 amount, address target) internal returns (uint256) {
+    (uint64 newClaimTime, uint64 usedClaimTime, uint256 claimAmount) = _calculateClaim(grantId, amount);
     if(claimAmount == 0) {
       return 0;
     }
 
-    _pledges[pledgeId].claimTime = newClaimTime;
+    _grants[grantId].claimTime = newClaimTime;
 
     // send claim amount to target
     (bool sent, ) = payable(target).call{value: claimAmount}("");
     require(sent, "failed to send ether");
 
-    emit FundClaim(pledgeId, target, claimAmount, usedClaimTime);
+    emit GrantClaim(grantId, target, claimAmount, usedClaimTime);
 
     return claimAmount;
   }
