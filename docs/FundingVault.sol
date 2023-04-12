@@ -64,6 +64,7 @@ struct Grant {
   uint64 claimTime;
   uint64 claimInterval;
   uint128 claimLimit;
+  uint256 dustBalance;
 }
 
 contract FundingVaultStorage {
@@ -80,7 +81,7 @@ contract FundingVaultStorage {
 }
 
 contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
-  bytes32 public constant PLEDGE_MANAGER_ROLE = keccak256("PLEDGE_MANAGER_ROLE");
+  bytes32 public constant GRANT_MANAGER_ROLE = keccak256("GRANT_MANAGER_ROLE");
 
   event GrantLock(uint64 indexed grantId, uint64 lockTime, uint64 lockTimeout);
   event GrantUpdate(uint64 indexed grantId, uint128 amount, uint64 interval);
@@ -88,7 +89,7 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   
   constructor() {
     _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
-    _grantRole(PLEDGE_MANAGER_ROLE, _msgSender());
+    _grantRole(GRANT_MANAGER_ROLE, _msgSender());
 
     _vaultTokenAddr = address(new FundingVaultToken(address(this)));
   }
@@ -123,7 +124,7 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   }
 
   function _calculateClaim(uint64 grantId, uint256 requestAmount) public view 
-    returns (uint64 newClaimTime, uint64 usedTime, uint256 claimAmount) {
+    returns (uint64 newClaimTime, uint64 usedTime, uint256 claimAmount, uint256 newDustBalance) {
     Grant memory grant = _grants[grantId];
     
     uint256 claimLimit = grant.claimLimit * 1 ether;
@@ -141,39 +142,56 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
       newClaimTime = grant.claimTime;
       usedTime = 0;
       claimAmount = 0;
+      newDustBalance = grant.dustBalance;
     }
     else if(grant.claimInterval == 0) {
       // no time restriction
       newClaimTime = time;
       usedTime = 0;
       claimAmount = requestAmount;
+      newDustBalance = 0;
     }
     else {
       uint64 baseClaimTime = grant.claimTime;
       uint64 availableTime = time - baseClaimTime;
+      uint256 dustBalance = grant.dustBalance;
       if(availableTime > grant.claimInterval) {
         availableTime = grant.claimInterval;
         baseClaimTime = time - grant.claimInterval;
+        dustBalance = 0;
       }
 
-      claimAmount = claimLimit * availableTime / grant.claimInterval;
-      if(requestAmount != 0 && requestAmount < claimAmount) {
-        // partial claim
-        usedTime = uint64(requestAmount * grant.claimInterval / claimLimit);
-        if(usedTime * claimLimit / grant.claimInterval < requestAmount) {
-          usedTime++; // round up if there is a rounding gap in ETH amount
-        }
-
-        if(usedTime > availableTime) {
-          usedTime = availableTime;
-        }
-
-        newClaimTime = baseClaimTime + usedTime;
+      if(requestAmount != 0 && requestAmount <= dustBalance) {
+        // take from dust balance
+        newClaimTime = baseClaimTime;
+        usedTime = 0;
         claimAmount = requestAmount;
+        newDustBalance = dustBalance - requestAmount;
       }
       else {
-        usedTime = availableTime;
-        newClaimTime = time;
+        claimAmount = (claimLimit * availableTime / grant.claimInterval) + dustBalance;
+
+        if(requestAmount != 0 && requestAmount < claimAmount) {
+          // partial claim
+          uint256 requestClaimAmount = requestAmount - dustBalance;
+          usedTime = uint64(requestClaimAmount * grant.claimInterval / claimLimit);
+          if(usedTime * claimLimit / grant.claimInterval < requestClaimAmount) {
+            usedTime++; // round up if there is a rounding gap in ETH amount
+            newDustBalance = (usedTime * claimLimit / grant.claimInterval) - requestClaimAmount;
+          }
+          else {
+            newDustBalance = 0;
+          }
+          require(usedTime <= availableTime, "calculation error: usedTime > availableTime");
+
+          newClaimTime = baseClaimTime + usedTime;
+          claimAmount = requestAmount;
+        }
+        else {
+          usedTime = availableTime;
+          newClaimTime = time;
+          newDustBalance = 0;
+        }
       }
     }
   }
@@ -229,26 +247,27 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   }
 
   function _claimableBalance(uint64 grantId) internal view returns (uint256) {
-    (, , uint256 claimAmount) = _calculateClaim(grantId, 0);
+    (, , uint256 claimAmount, ) = _calculateClaim(grantId, 0);
     return claimAmount;
   }
 
 
   //## Grant managemnet functions (Plege Manager)
 
-  function createGrant(address addr, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
+  function createGrant(address addr, uint128 amount, uint64 interval) public onlyRole(GRANT_MANAGER_ROLE) {
     uint64 grantId = _grantIdCounter++;
     _grants[grantId] = Grant({
       claimTime: _getTime() - interval,
       claimInterval: interval,
-      claimLimit: amount
+      claimLimit: amount,
+      dustBalance: 0
     });
     IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
 
     emit GrantUpdate(grantId, amount, interval);
   }
 
-  function updateGrant(uint64 grantId, uint128 amount, uint64 interval) public onlyRole(PLEDGE_MANAGER_ROLE) {
+  function updateGrant(uint64 grantId, uint128 amount, uint64 interval) public onlyRole(GRANT_MANAGER_ROLE) {
     require(_grants[grantId].claimTime > 0, "grant not found");
 
     _grants[grantId].claimInterval = interval;
@@ -257,12 +276,12 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     emit GrantUpdate(grantId, amount, interval);
   }
 
-  function transferGrant(uint64 grantId, address addr) public onlyRole(PLEDGE_MANAGER_ROLE) {
+  function transferGrant(uint64 grantId, address addr) public onlyRole(GRANT_MANAGER_ROLE) {
     require(_grants[grantId].claimTime > 0, "grant not found");
     IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, addr);
   }
 
-  function removeGrant(uint64 grantId) public onlyRole(PLEDGE_MANAGER_ROLE) {
+  function removeGrant(uint64 grantId) public onlyRole(GRANT_MANAGER_ROLE) {
     require(_grants[grantId].claimTime > 0, "grant not found");
 
     IFundingVaultToken(_vaultTokenAddr).tokenUpdate(grantId, address(0));
@@ -273,7 +292,7 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
     require(_grants[grantId].claimTime > 0, "grant not found");
     require(
       _msgSender() == _ownerOf(grantId) || 
-      hasRole(PLEDGE_MANAGER_ROLE, _msgSender())
+      hasRole(GRANT_MANAGER_ROLE, _msgSender())
     , "not grant owner or manager");
 
     _lockGrant(grantId, lockTime);
@@ -371,12 +390,13 @@ contract FundingVault is FundingVaultStorage, IFundingVault, AccessControl {
   }
 
   function _claim(uint64 grantId, uint256 amount, address target) internal returns (uint256) {
-    (uint64 newClaimTime, uint64 usedClaimTime, uint256 claimAmount) = _calculateClaim(grantId, amount);
+    (uint64 newClaimTime, uint64 usedClaimTime, uint256 claimAmount, uint256 newDustBalance) = _calculateClaim(grantId, amount);
     if(claimAmount == 0) {
       return 0;
     }
 
     _grants[grantId].claimTime = newClaimTime;
+    _grants[grantId].dustBalance = newDustBalance;
 
     // send claim amount to target
     (bool sent, ) = payable(target).call{value: claimAmount}("");
